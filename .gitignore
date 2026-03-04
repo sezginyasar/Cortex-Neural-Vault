@@ -1,0 +1,19 @@
+# --- Rust (Core) ---
+core/target/
+core/Cargo.lock
+
+# --- Go (Orchestrator) ---
+orchestrator/libcortex_core.dylib
+orchestrator/main_db.cognitive
+orchestrator/main_db.nexus
+orchestrator/go.sum
+
+# --- Vue 3 (Client) ---
+client/node_modules/
+client/dist/
+client/.vscode/
+client/.env.local
+
+# --- Genel ---
+.DS_Store
+*.log
