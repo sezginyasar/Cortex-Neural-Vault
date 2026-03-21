@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -39,7 +40,12 @@ func TranscribeAudio(audioData []byte) (string, error) {
 	// Model parametresini ekle
 	writer.WriteField("model", "whisper-large-v3")
 	writer.Close()
+	
 	apiKey := os.Getenv("GROQ_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("Sistem Hatası: GROQ_API_KEY bulunamadı. Lütfen export GROQ_API_KEY komutunu girip 'air' sunucusunu YENİDEN başlatın")
+	}
+	
 	// 3. API İsteği (Groq örneği)
 	req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/audio/transcriptions", body)
 	if err != nil {
@@ -56,6 +62,11 @@ func TranscribeAudio(audioData []byte) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Groq API Hatası (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+	}
 
 	// 4. Yanıtı oku
 	var result WhisperResponse
