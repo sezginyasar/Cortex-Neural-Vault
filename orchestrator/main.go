@@ -17,12 +17,19 @@ extern unsigned long long save_data(CortexEngine eng, MemoryVault vault, const c
 extern char* get_all_data_json(CortexEngine eng, MemoryVault vault);
 extern char* get_all_metadata_json(CortexEngine eng);
 extern char* get_data_by_id_json(CortexEngine eng, MemoryVault vault, unsigned long long id);
-extern char* search_vault(CortexEngine eng, MemoryVault vault, const char* query);
+extern char* search_vault(CortexEngine eng, MemoryVault vault, const char* query, unsigned long long start_ts, unsigned long long end_ts);
 extern char* get_trash_bin_json(CortexEngine eng);
 extern bool soft_delete_cell(CortexEngine eng, unsigned long long id);
 extern bool restore_cell(CortexEngine eng, unsigned long long id);
 extern unsigned long long trigger_garbage_collector(CortexEngine eng, unsigned long long retention_seconds);
 extern void free_cortex_string(char* ptr);
+
+// 🧠 Nöron Grafı FFI Köprüleri
+extern void add_sentence_neural(CortexEngine eng, unsigned long long sentence_id, const char* sentence, const char* category);
+extern char* search_neural_vault(CortexEngine eng, const char* query, const char* category);
+extern char* get_sentence_synapses_json(CortexEngine eng, const char* sentence);
+extern char* get_all_neurons_json(CortexEngine eng);
+extern char* get_sentence_synapses_by_id_json(CortexEngine eng, unsigned long long sentence_id);
 */
 import "C"
 import (
@@ -31,6 +38,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings" // ADD THIS
 	"time"
 	"unsafe"
 
@@ -81,6 +89,24 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// 🧠 1.5 Durum: Nöron listesini (Sözlüğü) getirir
+			if msgType == "GET_ALL_NEURONS" {
+				cJson := C.get_all_neurons_json(engine)
+				goJson := C.GoString(cJson)
+				C.free_cortex_string(cJson)
+
+				var neurons []map[string]interface{}
+				json.Unmarshal([]byte(goJson), &neurons)
+
+				rsp := map[string]interface{}{
+					"type": "ALL_NEURONS",
+					"data": neurons,
+				}
+				rspBytes, _ := json.Marshal(rsp)
+				ws.WriteMessage(websocket.TextMessage, rspBytes)
+				continue
+			}
+
 			// 2. Durum: AI sadece belirli bir veriyi (ID) istediğinde çalışır. Şifresini çözer.
 			if msgType == "GET_DATA_BY_ID" {
 				if idStr, ok := msg["id"].(string); ok {
@@ -89,7 +115,41 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 						cJson := C.get_data_by_id_json(engine, vault, C.ulonglong(id))
 						goJson := C.GoString(cJson)
 						C.free_cortex_string(cJson)
-						ws.WriteMessage(websocket.TextMessage, []byte(goJson))
+
+						// 🧠 Sinapsları çek (Cümledeki kelimeler için)
+						var rawRec map[string]interface{}
+						json.Unmarshal([]byte(goJson), &rawRec)
+						content, _ := rawRec["content"].(string)
+
+						var synapses map[string]interface{}
+						var primes []interface{}
+						if content != "" {
+							cContent := C.CString(content)
+							cSynapseJson := C.get_sentence_synapses_json(engine, cContent)
+							goSynapseJson := C.GoString(cSynapseJson)
+							C.free_cortex_string(cSynapseJson)
+							C.free(unsafe.Pointer(cContent))
+
+							json.Unmarshal([]byte(goSynapseJson), &synapses)
+
+							// 🧠 Asal Sayı Synapses Çek
+							cPrimesJson := C.get_sentence_synapses_by_id_json(engine, C.ulonglong(id))
+							goPrimesJson := C.GoString(cPrimesJson)
+							C.free_cortex_string(cPrimesJson)
+							json.Unmarshal([]byte(goPrimesJson), &primes)
+						}
+
+						// Zenginleştirilmiş yanıt
+						rsp := map[string]interface{}{
+							"id":          idStr,
+							"content":     content,
+							"synapses":    synapses,
+							"primes":      primes, // 🧠 Yeni
+							"owner":       rawRec["owner"],
+							"sensitivity": rawRec["sensitivity"],
+						}
+						rspBytes, _ := json.Marshal(rsp)
+						ws.WriteMessage(websocket.TextMessage, rspBytes)
 					} else {
 						ws.WriteMessage(websocket.TextMessage, []byte("Hata: Gecersiz ID formati"))
 					}
@@ -114,21 +174,43 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				// 1. Rust'tan sorguya uyan (Top 5) hafızaları bul (In-Memory RAG)
+				// 1. Rust'tan sorguya uyan (Top 20) hafızaları bul (In-Memory RAG)
 				cQuery := C.CString(question)
-				cJson := C.search_vault(engine, vault, cQuery)
+				startTs, endTs := parseDateRange(question) // 🧠 Yeni
+				cJson := C.search_vault(engine, vault, cQuery, C.ulonglong(startTs), C.ulonglong(endTs))
 				goJson := C.GoString(cJson)
 				C.free_cortex_string(cJson)
-				C.free(unsafe.Pointer(cQuery))
 
 				var memoryList []string
+				var sources []string // 🧠 Yeni: Kaynak Citation listesi
 				var rawRecords []map[string]interface{}
 				if err := json.Unmarshal([]byte(goJson), &rawRecords); err == nil {
 					for _, r := range rawRecords {
 						if content, ok := r["content"].(string); ok && content != "" {
 							memoryList = append(memoryList, content)
+							
+							idStr := "0"
+							if idVal, ok := r["id"]; ok {
+								idStr = fmt.Sprintf("%v", idVal)
+							}
+							sources = append(sources, fmt.Sprintf("#%s: %s", idStr, content))
 						}
 					}
+				}
+
+				// 🧠 2. Sinaps Grafından da arayalım (Nöron Bağlantıları)
+				cCategory := C.CString("genel") 
+				cNeuralJson := C.search_neural_vault(engine, cQuery, cCategory)
+				goNeuralJson := C.GoString(cNeuralJson)
+				C.free_cortex_string(cNeuralJson)
+				C.free(unsafe.Pointer(cCategory))
+				C.free(unsafe.Pointer(cQuery)) // C.CString(question) bitti
+
+				var neuralWords []string
+				if err := json.Unmarshal([]byte(goNeuralJson), &neuralWords); err == nil && len(neuralWords) > 0 {
+					// Yapay zekaya sinapslardan gelen kelimeleri de ipucu/bağlam olarak besle
+					memoryList = append(memoryList, fmt.Sprintf("[Nöron Sinaps İpuçları]: %s", strings.Join(neuralWords, ", ")))
+					sources = append(sources, fmt.Sprintf("[Sinaps Grafı İpucu]: %s", strings.Join(neuralWords, ", ")))
 				}
 
 				// 2. Groq'a gönder (chat.go)
@@ -140,9 +222,10 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 					})
 					ws.WriteMessage(websocket.TextMessage, rspBytes)
 				} else {
-					rspBytes, _ := json.Marshal(map[string]string{
-						"type": "AI_RESPONSE",
-						"text": answer,
+					rspBytes, _ := json.Marshal(map[string]interface{}{
+						"type":    "AI_RESPONSE",
+						"text":    answer,
+						"sources": sources, // 🧠 Yeni
 					})
 					ws.WriteMessage(websocket.TextMessage, rspBytes)
 				}
@@ -249,7 +332,28 @@ func saveToRust(ws *websocket.Conn, contentStr, ownerStr string, level byte) {
 	defer C.free(unsafe.Pointer(cContent))
 	defer C.free(unsafe.Pointer(cOwner))
 
-	C.save_data(engine, vault, cContent, C.uchar(level), cOwner)
+	id := C.save_data(engine, vault, cContent, C.uchar(level), cOwner)
+
+	// 🧠 Nöron Grafına da ekle
+	category := "genel"
+	cleanContent := contentStr
+	if strings.HasPrefix(contentStr, "iş:") {
+		category = "iş"
+		cleanContent = strings.TrimSpace(strings.TrimPrefix(contentStr, "iş:"))
+	} else if strings.HasPrefix(contentStr, "aile:") {
+		category = "aile"
+		cleanContent = strings.TrimSpace(strings.TrimPrefix(contentStr, "aile:"))
+	} else if strings.HasPrefix(contentStr, "özel:") {
+		category = "özel"
+		cleanContent = strings.TrimSpace(strings.TrimPrefix(contentStr, "özel:"))
+	}
+
+	cCleanContent := C.CString(cleanContent)
+	cCategory := C.CString(category)
+	defer C.free(unsafe.Pointer(cCleanContent))
+	defer C.free(unsafe.Pointer(cCategory))
+
+	C.add_sentence_neural(engine, id, cCleanContent, cCategory)
 
 	// Yeni Chat UI'ın parse edebilmesi için JSON yapısında dön
 	respMsg := map[string]string{
@@ -258,6 +362,29 @@ func saveToRust(ws *websocket.Conn, contentStr, ownerStr string, level byte) {
 	}
 	respBytes, _ := json.Marshal(respMsg)
 	ws.WriteMessage(websocket.TextMessage, respBytes)
+}
+
+func parseDateRange(question string) (uint64, uint64) {
+	now := time.Now()
+	q := strings.ToLower(question)
+
+	if strings.Contains(q, "son 3 gün") {
+		return uint64(now.Add(-3 * 24 * time.Hour).Unix()), uint64(now.Unix())
+	}
+	if strings.Contains(q, "son 1 hafta") || strings.Contains(q, "geçen hafta") {
+		return uint64(now.Add(-7 * 24 * time.Hour).Unix()), uint64(now.Unix())
+	}
+	if strings.Contains(q, "dün") {
+		yesterday := now.Add(-24 * time.Hour)
+		start := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), 0, 0, 0, 0, now.Location())
+		end := time.Date(yesterday.Year(), yesterday.Month(), yesterday.Day(), 23, 59, 59, 0, now.Location())
+		return uint64(start.Unix()), uint64(end.Unix())
+	}
+	if strings.Contains(q, "bugün") {
+		start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		return uint64(start.Unix()), uint64(now.Unix())
+	}
+	return 0, 0
 }
 
 func main() {

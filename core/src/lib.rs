@@ -8,6 +8,52 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use zeroize::Zeroize;
 
+pub fn is_prime(n: u64) -> bool {
+    if n <= 1 { return false; }
+    if n <= 3 { return true; }
+    if n % 2 == 0 || n % 3 == 0 { return false; }
+    let mut i = 5;
+    while i * i <= n {
+        if n % i == 0 || n % (i + 2) == 0 { return false; }
+        i += 6;
+    }
+    true
+}
+
+pub fn next_prime(n: u64) -> u64 {
+    let mut p = n + 1;
+    while !is_prime(p) {
+        p += 1;
+    }
+    p
+}
+
+pub fn tokenize(sentence: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current_word = String::new();
+
+    for c in sentence.chars() {
+        if c.is_whitespace() {
+            if !current_word.is_empty() {
+                tokens.push(current_word.clone());
+                current_word.clear();
+            }
+        } else if !c.is_alphanumeric() {
+            if !current_word.is_empty() {
+                tokens.push(current_word.clone());
+                current_word.clear();
+            }
+            tokens.push(c.to_string());
+        } else {
+            current_word.push(c);
+        }
+    }
+    if !current_word.is_empty() {
+        tokens.push(current_word);
+    }
+    tokens
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SensitivityLevel {
     Level1,
@@ -20,6 +66,8 @@ pub struct CellMetadata {
     pub id: u64,
     pub sensitivity: SensitivityLevel,
     pub owner_id: String,
+    #[serde(default)]
+    pub created_at: u64, // 🧠 Yeni
     pub deleted_at: Option<u64>,
 }
 
@@ -39,6 +87,8 @@ pub struct CortexCell {
     pub content: Vec<u8>,
     pub sensitivity: SensitivityLevel,
     pub owner_id: String,
+    #[serde(default)]
+    pub created_at: u64, // 🧠 Yeni
     pub deleted_at: Option<u64>,
 }
 
@@ -85,18 +135,118 @@ impl MemoryVault {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Synapse {
+    pub target_id: u64,
+    pub category: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct NeuralVault {
+    pub word_to_id: HashMap<String, u64>,
+    pub id_to_word: HashMap<u64, String>,
+    pub synapses: HashMap<u64, Vec<Synapse>>,
+    pub next_id: u64,
+    pub sentence_synapses: HashMap<u64, Vec<u64>>, // 🧠 Cümle ID -> Kelime Prime ID'leri
+}
+
+impl NeuralVault {
+    pub fn new() -> Self {
+        NeuralVault {
+            word_to_id: HashMap::new(),
+            id_to_word: HashMap::new(),
+            synapses: HashMap::new(),
+            next_id: 2, // 2'den başlatıyoruz (Asal sayı sayacı)
+            sentence_synapses: HashMap::new(),
+        }
+    }
+
+    pub fn get_or_create_neuron(&mut self, word: &str) -> u64 {
+        let clean_word = word.to_lowercase().trim().to_string();
+        if let Some(&id) = self.word_to_id.get(&clean_word) {
+            return id;
+        }
+        let id = self.next_id;
+        self.word_to_id.insert(clean_word.clone(), id);
+        self.id_to_word.insert(id, clean_word);
+        self.next_id = next_prime(self.next_id);
+        id
+    }
+
+    pub fn add_sentence(&mut self, sentence_id: u64, sentence: &str, category: &str) {
+        let words = tokenize(sentence);
+        let mut prev_id: Option<u64> = None;
+        let mut prime_ids = Vec::new();
+
+        for word in &words {
+            let id = self.get_or_create_neuron(word);
+            prime_ids.push(id);
+            
+            if let Some(p_id) = prev_id {
+                let edge = Synapse {
+                    target_id: id,
+                    category: category.to_string(),
+                };
+                self.synapses.entry(p_id).or_insert(Vec::new()).push(edge);
+            }
+            prev_id = Some(id);
+        }
+
+        // 🧠 Cümle ID'sine göre kullanılan tüm asal sayıları (kelimeleri) kaydet
+        self.sentence_synapses.insert(sentence_id, prime_ids);
+    }
+
+    pub fn search(&self, query_word: &str, category: &str) -> Vec<String> {
+        let mut results = Vec::new();
+        let query_lower = query_word.to_lowercase();
+
+        if let Some(&id) = self.word_to_id.get(&query_lower) {
+            if let Some(edges) = self.synapses.get(&id) {
+                for edge in edges {
+                    if edge.category == category {
+                        if let Some(word) = self.id_to_word.get(&edge.target_id) {
+                            results.push(word.clone());
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        let bytes = bincode::serialize(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut file = File::create(path)?;
+        file.write_all(&bytes)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &str) -> std::io::Result<Self> {
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let vault: NeuralVault = bincode::deserialize(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(vault)
+    }
+}
+
 // Veritabanı Motoru: Storage + Index
 pub struct CortexEngine {
     storage_path: String,
     // ID -> (Metadata, Content Payload Offset, Payload Length)
     index: HashMap<u64, (CellMetadata, u64, u64)>, 
+    pub neural_graph: NeuralVault, // Bellek içi nöron grafı
 }
 
 impl CortexEngine {
     pub fn new(storage_path: &str) -> Self {
+        let graph_path = format!("{}.graph", storage_path);
+        let neural_graph = NeuralVault::load_from_file(&graph_path).unwrap_or_else(|_| NeuralVault::new());
+
         let mut engine = CortexEngine {
             storage_path: storage_path.to_string(),
             index: HashMap::new(),
+            neural_graph,
         };
 
         if std::path::Path::new(storage_path).exists() {
@@ -161,6 +311,7 @@ impl CortexEngine {
             id: cell.id,
             sensitivity: cell.sensitivity.clone(),
             owner_id: cell.owner_id.clone(),
+            created_at: cell.created_at,
             deleted_at: cell.deleted_at,
         };
 
@@ -195,6 +346,7 @@ impl CortexEngine {
             sensitivity: meta.sensitivity.clone(),
             owner_id: meta.owner_id.clone(),
             content: buffer,
+            created_at: meta.created_at,
             deleted_at: meta.deleted_at,
         })
     }
@@ -206,11 +358,17 @@ pub fn create_secure_cell(
     level: SensitivityLevel,
     owner: &str,
 ) -> CortexCell {
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
+
     CortexCell {
         id: rand::random::<u64>(),
         content: vault.encrypt(content.as_bytes()),
         sensitivity: level,
         owner_id: owner.to_string(),
+        created_at: now_ts,
         deleted_at: None,
     }
 }
@@ -336,12 +494,14 @@ pub extern "C" fn get_data_by_id_json(
 }
 
 
-// YENİ EKLENDİ - IN-MEMORY RAG SEARCH: Tüm vault'u ramde çözer, kelime arar, top 5'i döner
+// YENİ EKLENDİ - IN-MEMORY RAG SEARCH: Tüm vault'u ramde çözer, kelime arar, top 20'yi döner
 #[unsafe(no_mangle)]
 pub extern "C" fn search_vault(
     engine_ptr: *mut CortexEngine, 
     vault_ptr: *mut MemoryVault, 
-    query_ptr: *const c_char
+    query_ptr: *const c_char,
+    start_ts: u64, // 🧠 Yeni: Başlangıç Zamanı
+    end_ts: u64    // 🧠 Yeni: Bitiş Zamanı
 ) -> *mut c_char {
     let engine = unsafe { &*engine_ptr };
     let vault = unsafe { &*vault_ptr };
@@ -350,7 +510,6 @@ pub extern "C" fn search_vault(
     let query_lower = c_query.to_lowercase();
     let keywords: Vec<&str> = query_lower.split_whitespace().collect();
     
-    // Eğer çok kısa veya boş bir soruysa tüm verileri dönmeyelim, boş dönelim.
     if keywords.is_empty() {
         return CString::new("[]").unwrap().into_raw();
     }
@@ -361,6 +520,15 @@ pub extern "C" fn search_vault(
         if meta.deleted_at.is_some() {
             continue;
         }
+
+        // 🧠 Tarih Filtresi
+        if start_ts > 0 && meta.created_at < start_ts {
+            continue;
+        }
+        if end_ts > 0 && meta.created_at > end_ts {
+            continue;
+        }
+
         if let Some(cell) = engine.get_cell(id) {
             let decrypted_bytes = vault.decrypt(&cell.content);
             let content_str = String::from_utf8_lossy(&decrypted_bytes).to_string();
@@ -369,7 +537,6 @@ pub extern "C" fn search_vault(
             let mut score = 0;
             for &kw in &keywords {
                 let char_count = kw.chars().count();
-                // 2 harften büyükleri sorgula, Türkçe ekleri(sondan eklemeli) atlatmak için ilk 5 harfi kök say
                 if char_count > 2 {
                     let prefix_len = std::cmp::min(5, char_count);
                     let prefix: String = kw.chars().take(prefix_len).collect();
@@ -378,20 +545,15 @@ pub extern "C" fn search_vault(
                     }
                 }
             }
-            
-            // Eğer en az 1 kelime eşleştiyse, listeye ekle
             if score > 0 {
                 scored_results.push((score, cell.id, content_str, cell.owner_id));
             }
         }
     }
-    
-    // Yüksek skordan düşüğe sırala
     scored_results.sort_by(|a, b| b.0.cmp(&a.0));
-    
     let mut final_results = Vec::new();
-    // Top 5 kaydı al ve JSON'a çevir
-    for (score, id, content, owner) in scored_results.into_iter().take(5) {
+    // Top 20 kaydı al ve JSON'a çevir
+    for (score, id, content, owner) in scored_results.into_iter().take(20) {
         final_results.push(serde_json::json!({
             "id": id.to_string(),
             "content": content,
@@ -492,6 +654,115 @@ pub extern "C" fn free_cortex_string(ptr: *mut c_char) {
     unsafe {
         let _ = CString::from_raw(ptr);
     };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn add_sentence_neural(
+    engine_ptr: *mut CortexEngine,
+    sentence_id: u64, // 🧠 Cümle ID'si eklendi
+    sentence_ptr: *const c_char,
+    category_ptr: *const c_char,
+) {
+    let engine = unsafe { &mut *engine_ptr };
+    let c_sentence = unsafe { CStr::from_ptr(sentence_ptr) }.to_str().unwrap_or("");
+    let c_category = unsafe { CStr::from_ptr(category_ptr) }.to_str().unwrap_or("genel");
+    
+    engine.neural_graph.add_sentence(sentence_id, c_sentence, c_category);
+    
+    // Değişikliği diske kaydet
+    let graph_path = format!("{}.graph", engine.storage_path);
+    let _ = engine.neural_graph.save_to_file(&graph_path);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn search_neural_vault(
+    engine_ptr: *mut CortexEngine,
+    query_ptr: *const c_char,
+    category_ptr: *const c_char,
+) -> *mut c_char {
+    let engine = unsafe { &*engine_ptr };
+    let c_query = unsafe { CStr::from_ptr(query_ptr) }.to_str().unwrap_or("");
+    let c_category = unsafe { CStr::from_ptr(category_ptr) }.to_str().unwrap_or("genel");
+    
+    let results = engine.neural_graph.search(c_query, c_category);
+    let json_str = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json_str).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_sentence_synapses_json(
+    engine_ptr: *mut CortexEngine,
+    sentence_ptr: *const c_char,
+) -> *mut c_char {
+    let engine = unsafe { &*engine_ptr };
+    let c_sentence = unsafe { CStr::from_ptr(sentence_ptr) }.to_str().unwrap_or("");
+    let words = tokenize(c_sentence);
+    
+    let mut results: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+    for word in &words {
+        let clean_word = word.to_lowercase();
+        if let Some(&id) = engine.neural_graph.word_to_id.get(&clean_word) {
+            if let Some(edges) = engine.neural_graph.synapses.get(&id) {
+                let mut edge_list = Vec::new();
+                for edge in edges {
+                    if let Some(target_word) = engine.neural_graph.id_to_word.get(&edge.target_id) {
+                        edge_list.push(serde_json::json!({
+                            "source_id": id,
+                            "target_id": edge.target_id,
+                            "target": target_word,
+                            "category": edge.category
+                        }));
+                    }
+                }
+                if !edge_list.is_empty() {
+                    results.insert(clean_word, edge_list);
+                }
+            }
+        }
+    }
+
+    let json_str = serde_json::to_string(&results).unwrap_or_else(|_| "{}".to_string());
+    CString::new(json_str).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_sentence_synapses_by_id_json(
+    engine_ptr: *mut CortexEngine,
+    sentence_id: u64,
+) -> *mut c_char {
+    let engine = unsafe { &*engine_ptr };
+    let mut primes = Vec::new();
+    
+    if let Some(list) = engine.neural_graph.sentence_synapses.get(&sentence_id) {
+        primes = list.clone();
+    }
+    
+    let json_str = serde_json::to_string(&primes).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json_str).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_all_neurons_json(engine_ptr: *mut CortexEngine) -> *mut c_char {
+    let engine = unsafe { &*engine_ptr };
+    let mut results = Vec::new();
+
+    for (id, word) in &engine.neural_graph.id_to_word {
+        results.push(serde_json::json!({
+            "id": id,
+            "word": word
+        }));
+    }
+
+    // ID'ye göre sırala
+    results.sort_by(|a, b| {
+        let a_id = a["id"].as_u64().unwrap_or(0);
+        let b_id = b["id"].as_u64().unwrap_or(0);
+        a_id.cmp(&b_id)
+    });
+
+    let json_str = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    CString::new(json_str).unwrap().into_raw()
 }
 
 #[cfg(test)]
