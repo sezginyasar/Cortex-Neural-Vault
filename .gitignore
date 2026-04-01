@@ -17,3 +17,5 @@ client/.env.local
 # --- Genel ---
 .DS_Store
 *.log
+notebook_lm_presentation.md
+orchestrator/main_db.cognitive.graph
